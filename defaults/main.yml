@@ -374,6 +374,14 @@ rke2_spire_ca_ttl: 24h
 # Default SVID TTL for general workloads
 rke2_spire_svid_ttl: 1h
 
+# PVC size for SPIRE server persistent data (keys + SQLite datastore).
+# Both the disk KeyManager and SQLite datastore write to this volume so that
+# CA keys and registration entries survive server pod restarts.
+rke2_spire_server_storage_size: 1Gi
+
+# StorageClass for the SPIRE server PVC. Leave empty to use the cluster default.
+rke2_spire_server_storage_class: ""
+
 # Short SVID TTL (seconds) for LLM agent namespaces — limits blast radius of
 # a compromised agent token and bounds the rotation load on the SPIRE server
 rke2_spire_llm_svid_ttl_seconds: 300

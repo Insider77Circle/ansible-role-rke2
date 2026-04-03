@@ -11,25 +11,34 @@
 #   silently bypassing zero-trust guarantees.
 #
 #   This task file addresses that gap by:
-#     1. Deploying SPIRE server and agent for K8s node attestation (k8s_psat)
-#     2. Registering short-TTL SVID entries for LLM workload namespaces
+#     1. Deploying SPIRE server (Deployment) and agent (DaemonSet) with k8s_psat
+#        node attestation and disk-backed key/data storage
+#     2. Registering short-TTL SVID entries for LLM workload namespaces with
+#        service-account-scoped selectors
 #     3. Enforcing pod count quotas per namespace to cap SVID minting demand
 #     4. Applying LimitRange to prevent unbounded burst pod scheduling
 #
 # Variables (set in defaults/main.yml):
-#   rke2_spire_enabled                 - enable this task block (default: false)
-#   rke2_spire_namespace               - K8s namespace for SPIRE components (default: spire)
-#   rke2_spire_trust_domain            - SPIFFE trust domain (default: example.org)
-#   rke2_spire_ca_ttl                  - CA certificate TTL (default: 24h)
-#   rke2_spire_svid_ttl                - default SVID TTL (default: 1h)
-#   rke2_spire_llm_svid_ttl_seconds    - short TTL for LLM agent SVIDs (default: 300)
-#   rke2_spire_llm_namespaces          - list of namespaces hosting LLM agent workloads
+#   rke2_spire_enabled                    - enable this task block (default: false)
+#   rke2_spire_namespace                  - K8s namespace for SPIRE components (default: spire)
+#   rke2_spire_trust_domain               - SPIFFE trust domain (default: example.org)
+#   rke2_spire_ca_ttl                     - CA certificate TTL (default: 24h)
+#   rke2_spire_svid_ttl                   - default SVID TTL (default: 1h)
+#   rke2_spire_server_storage_size        - PVC size for SPIRE server data/keys (default: 1Gi)
+#   rke2_spire_server_storage_class       - StorageClass for server PVC (default: "")
+#   rke2_spire_llm_svid_ttl_seconds       - short TTL for LLM agent SVIDs (default: 300)
+#   rke2_spire_llm_namespaces             - list of namespaces hosting LLM agent workloads
 #   rke2_spire_llm_max_pods_per_namespace - pod quota cap per LLM namespace (default: 50)
-#   rke2_spire_llm_pod_max_cpu         - max CPU per pod in LLM namespaces (default: "4")
-#   rke2_spire_llm_pod_max_memory      - max memory per pod in LLM namespaces (default: "16Gi")
+#   rke2_spire_llm_pod_max_cpu            - max CPU per pod in LLM namespaces (default: "4")
+#   rke2_spire_llm_pod_max_memory         - max memory per pod in LLM namespaces (default: "16Gi")
+
+# ---------------------------------------------------------------------------
+# Namespace
+# ---------------------------------------------------------------------------
 
 - name: Create SPIRE namespace
   kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/rke2/rke2.yaml
     state: present
     definition:
       apiVersion: v1
@@ -43,8 +52,114 @@
     - rke2_spire_enabled | bool
     - inventory_hostname == groups[rke2_servers_group_name].0
 
+# ---------------------------------------------------------------------------
+# ServiceAccounts
+# ---------------------------------------------------------------------------
+
+- name: Create SPIRE server ServiceAccount
+  kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/rke2/rke2.yaml
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: spire-server
+        namespace: "{{ rke2_spire_namespace }}"
+  when:
+    - rke2_spire_enabled | bool
+    - inventory_hostname == groups[rke2_servers_group_name].0
+
+- name: Create SPIRE agent ServiceAccount
+  kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/rke2/rke2.yaml
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: spire-agent
+        namespace: "{{ rke2_spire_namespace }}"
+  when:
+    - rke2_spire_enabled | bool
+    - inventory_hostname == groups[rke2_servers_group_name].0
+
+# ---------------------------------------------------------------------------
+# RBAC
+# ---------------------------------------------------------------------------
+
+- name: Create SPIRE agent ClusterRole
+  kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/rke2/rke2.yaml
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: spire-agent-cluster-role
+      rules:
+        - apiGroups: [""]
+          resources: ["pods", "nodes", "nodes/proxy"]
+          verbs: ["get"]
+  when:
+    - rke2_spire_enabled | bool
+    - inventory_hostname == groups[rke2_servers_group_name].0
+
+- name: Create SPIRE agent ClusterRoleBinding
+  kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/rke2/rke2.yaml
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: spire-agent-cluster-role-binding
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: spire-agent-cluster-role
+      subjects:
+        - kind: ServiceAccount
+          name: spire-agent
+          namespace: "{{ rke2_spire_namespace }}"
+  when:
+    - rke2_spire_enabled | bool
+    - inventory_hostname == groups[rke2_servers_group_name].0
+
+# ---------------------------------------------------------------------------
+# Persistent storage for SPIRE server (keys + datastore)
+# Using disk KeyManager and a PVC-backed data_dir prevents CA key loss and
+# registration entry loss across server pod restarts.
+# ---------------------------------------------------------------------------
+
+- name: Create PersistentVolumeClaim for SPIRE server data
+  kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/rke2/rke2.yaml
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: spire-server-data
+        namespace: "{{ rke2_spire_namespace }}"
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: "{{ rke2_spire_server_storage_class }}"
+        resources:
+          requests:
+            storage: "{{ rke2_spire_server_storage_size }}"
+  when:
+    - rke2_spire_enabled | bool
+    - inventory_hostname == groups[rke2_servers_group_name].0
+
+# ---------------------------------------------------------------------------
+# ConfigMaps
+# ---------------------------------------------------------------------------
+
 - name: Deploy SPIRE server ConfigMap
   kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/rke2/rke2.yaml
     state: present
     definition:
       apiVersion: v1
@@ -67,6 +182,7 @@
             DataStore "sql" {
               plugin_data {
                 database_type = "sqlite3"
+                # PVC-backed path — survives pod restarts
                 connection_string = "/run/spire/data/datastore.sqlite3"
               }
             }
@@ -79,8 +195,12 @@
                 }
               }
             }
-            KeyManager "memory" {
-              plugin_data {}
+            # disk KeyManager: CA private keys persisted to the PVC-backed data_dir.
+            # keys.json survives pod restarts; previously issued SVIDs remain valid.
+            KeyManager "disk" {
+              plugin_data {
+                keys_path = "/run/spire/data/keys.json"
+              }
             }
           }
           health_checks {
@@ -96,6 +216,7 @@
 
 - name: Deploy SPIRE agent ConfigMap
   kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/rke2/rke2.yaml
     state: present
     definition:
       apiVersion: v1
@@ -148,54 +269,216 @@
     - rke2_spire_enabled | bool
     - inventory_hostname == groups[rke2_servers_group_name].0
 
-- name: Create SPIRE agent ClusterRole
+# ---------------------------------------------------------------------------
+# SPIRE server Service (agents connect to this)
+# ---------------------------------------------------------------------------
+
+- name: Deploy SPIRE server Service
   kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/rke2/rke2.yaml
     state: present
     definition:
-      apiVersion: rbac.authorization.k8s.io/v1
-      kind: ClusterRole
+      apiVersion: v1
+      kind: Service
       metadata:
-        name: spire-agent-cluster-role
-      rules:
-        - apiGroups: [""]
-          resources: ["pods", "nodes", "nodes/proxy"]
-          verbs: ["get"]
+        name: spire-server
+        namespace: "{{ rke2_spire_namespace }}"
+      spec:
+        type: ClusterIP
+        selector:
+          app: spire-server
+        ports:
+          - name: grpc
+            port: 8081
+            targetPort: 8081
+            protocol: TCP
   when:
     - rke2_spire_enabled | bool
     - inventory_hostname == groups[rke2_servers_group_name].0
 
-- name: Create SPIRE agent ClusterRoleBinding
+# ---------------------------------------------------------------------------
+# SPIRE server Deployment
+# ---------------------------------------------------------------------------
+
+- name: Deploy SPIRE server Deployment
   kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/rke2/rke2.yaml
     state: present
     definition:
-      apiVersion: rbac.authorization.k8s.io/v1
-      kind: ClusterRoleBinding
+      apiVersion: apps/v1
+      kind: Deployment
       metadata:
-        name: spire-agent-cluster-role-binding
-      roleRef:
-        apiGroup: rbac.authorization.k8s.io
-        kind: ClusterRole
-        name: spire-agent-cluster-role
-      subjects:
-        - kind: ServiceAccount
-          name: spire-agent
-          namespace: "{{ rke2_spire_namespace }}"
+        name: spire-server
+        namespace: "{{ rke2_spire_namespace }}"
+        labels:
+          app: spire-server
+      spec:
+        replicas: 1
+        selector:
+          matchLabels:
+            app: spire-server
+        template:
+          metadata:
+            labels:
+              app: spire-server
+          spec:
+            serviceAccountName: spire-server
+            containers:
+              - name: spire-server
+                image: ghcr.io/spiffe/spire-server:1.9.6
+                args:
+                  - -config
+                  - /run/spire/config/server.conf
+                ports:
+                  - containerPort: 8081
+                  - containerPort: 8080
+                livenessProbe:
+                  httpGet:
+                    path: /live
+                    port: 8080
+                  initialDelaySeconds: 15
+                  periodSeconds: 20
+                readinessProbe:
+                  httpGet:
+                    path: /ready
+                    port: 8080
+                  initialDelaySeconds: 5
+                  periodSeconds: 10
+                volumeMounts:
+                  - name: spire-config
+                    mountPath: /run/spire/config
+                    readOnly: true
+                  - name: spire-data
+                    mountPath: /run/spire/data
+            volumes:
+              - name: spire-config
+                configMap:
+                  name: spire-server
+              - name: spire-data
+                persistentVolumeClaim:
+                  claimName: spire-server-data
   when:
     - rke2_spire_enabled | bool
     - inventory_hostname == groups[rke2_servers_group_name].0
+
+# ---------------------------------------------------------------------------
+# SPIRE agent DaemonSet (runs on every node)
+# ---------------------------------------------------------------------------
+
+- name: Deploy SPIRE agent DaemonSet
+  kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/rke2/rke2.yaml
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: spire-agent
+        namespace: "{{ rke2_spire_namespace }}"
+        labels:
+          app: spire-agent
+      spec:
+        selector:
+          matchLabels:
+            app: spire-agent
+        template:
+          metadata:
+            labels:
+              app: spire-agent
+          spec:
+            serviceAccountName: spire-agent
+            hostPID: true
+            hostNetwork: true
+            dnsPolicy: ClusterFirstWithHostNet
+            initContainers:
+              - name: init
+                image: cgr.dev/chainguard/wait-for-it
+                args:
+                  - spire-server:8081
+                  - --timeout=30
+            containers:
+              - name: spire-agent
+                image: ghcr.io/spiffe/spire-agent:1.9.6
+                args:
+                  - -config
+                  - /run/spire/config/agent.conf
+                livenessProbe:
+                  httpGet:
+                    path: /live
+                    port: 8080
+                  initialDelaySeconds: 15
+                  periodSeconds: 20
+                readinessProbe:
+                  httpGet:
+                    path: /ready
+                    port: 8080
+                  initialDelaySeconds: 5
+                  periodSeconds: 10
+                volumeMounts:
+                  - name: spire-config
+                    mountPath: /run/spire/config
+                    readOnly: true
+                  - name: spire-bundle
+                    mountPath: /run/spire/bundle
+                  - name: spire-agent-socket
+                    mountPath: /run/spire/sockets
+                    readOnly: false
+            volumes:
+              - name: spire-config
+                configMap:
+                  name: spire-agent
+              - name: spire-bundle
+                configMap:
+                  name: spire-bundle
+                  optional: true
+              - name: spire-agent-socket
+                hostPath:
+                  path: /run/spire/sockets
+                  type: DirectoryOrCreate
+  when:
+    - rke2_spire_enabled | bool
+    - inventory_hostname == groups[rke2_servers_group_name].0
+
+# ---------------------------------------------------------------------------
+# Wait for SPIRE server to be ready before registering entries
+# ---------------------------------------------------------------------------
+
+- name: Wait for SPIRE server deployment to be ready
+  ansible.builtin.command:
+    cmd: >
+      /var/lib/rancher/rke2/bin/kubectl rollout status deployment/spire-server
+      -n {{ rke2_spire_namespace }}
+      --timeout=120s
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  when:
+    - rke2_spire_enabled | bool
+    - inventory_hostname == groups[rke2_servers_group_name].0
+  changed_when: false
+
+# ---------------------------------------------------------------------------
+# SVID entry registration for LLM workload namespaces
+# ---------------------------------------------------------------------------
 
 - name: Register short-TTL SVID entries for LLM workload namespaces
   # Short TTL (rke2_spire_llm_svid_ttl_seconds, default 300s) limits the blast
   # radius of a compromised agent token. Combined with pod quotas below, this
   # bounds the minting load that prompt-driven agent spawning can impose on SPIRE.
+  #
+  # Both k8s:ns and k8s:sa selectors are required — namespace alone is too broad
+  # and would match every pod in the namespace regardless of service account.
   ansible.builtin.command:
     cmd: >
-      kubectl exec -n {{ rke2_spire_namespace }} deployment/spire-server --
+      /var/lib/rancher/rke2/bin/kubectl exec -n {{ rke2_spire_namespace }}
+      deployment/spire-server --
       /opt/spire/bin/spire-server entry create
       -spiffeID spiffe://{{ rke2_spire_trust_domain }}/ns/{{ item }}/sa/default
       -parentID spiffe://{{ rke2_spire_trust_domain }}/ns/{{ rke2_spire_namespace }}/sa/spire-agent
       -selector k8s:ns:{{ item }}
+      -selector k8s:sa:default
       -ttl {{ rke2_spire_llm_svid_ttl_seconds }}
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
   loop: "{{ rke2_spire_llm_namespaces }}"
   register: spire_entry_result
   failed_when:
@@ -207,11 +490,16 @@
     - rke2_spire_llm_namespaces | length > 0
     - inventory_hostname == groups[rke2_servers_group_name].0
 
+# ---------------------------------------------------------------------------
+# Namespace-level controls to cap SVID minting demand
+# ---------------------------------------------------------------------------
+
 - name: Apply ResourceQuota to cap pod count per LLM namespace
   # Caps total pods per LLM workload namespace to prevent prompt-driven cascading
   # tool calls from scheduling enough pods to exhaust SPIRE SVID minting capacity.
   # Size rke2_spire_llm_max_pods_per_namespace to your SPIRE server's minting budget.
   kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/rke2/rke2.yaml
     state: present
     definition:
       apiVersion: v1
@@ -233,6 +521,7 @@
 
 - name: Apply LimitRange to constrain individual LLM agent pod resource footprint
   kubernetes.core.k8s:
+    kubeconfig: /etc/rancher/rke2/rke2.yaml
     state: present
     definition:
       apiVersion: v1
