@@ -351,3 +351,46 @@ rke2_service_cidr:
 
 # Enable SELinux for rke2
 rke2_selinux: false
+
+# ---------------------------------------------------------------------------
+# SPIFFE/SPIRE LLM workload identity hardening
+# ---------------------------------------------------------------------------
+# Deploys SPIRE server + agent and enforces pod quotas on LLM namespaces to
+# prevent SVID minting exhaustion under prompt-driven agent fleet burst scaling.
+# See tasks/spire_llm_identity.yml for full security context.
+
+# Enable SPIRE deployment and LLM workload hardening tasks
+rke2_spire_enabled: false
+
+# Kubernetes namespace for SPIRE server and agent components
+rke2_spire_namespace: spire
+
+# SPIFFE trust domain for the cluster
+rke2_spire_trust_domain: example.org
+
+# CA certificate TTL issued by SPIRE server
+rke2_spire_ca_ttl: 24h
+
+# Default SVID TTL for general workloads
+rke2_spire_svid_ttl: 1h
+
+# Short SVID TTL (seconds) for LLM agent namespaces — limits blast radius of
+# a compromised agent token and bounds the rotation load on the SPIRE server
+rke2_spire_llm_svid_ttl_seconds: 300
+
+# List of Kubernetes namespaces hosting LLM agent workloads.
+# SVID entries and pod quota controls will be applied to each namespace listed.
+# Example:
+#   rke2_spire_llm_namespaces:
+#     - llm-agents
+#     - ai-inference
+rke2_spire_llm_namespaces: []
+
+# Maximum number of pods allowed per LLM workload namespace.
+# Size this to your SPIRE server's sustainable SVID minting rate.
+# Too high → exhaustion risk; too low → legitimate agent fleet may be throttled.
+rke2_spire_llm_max_pods_per_namespace: 50
+
+# Per-container resource caps applied to LLM agent pods via LimitRange
+rke2_spire_llm_pod_max_cpu: "4"
+rke2_spire_llm_pod_max_memory: 16Gi

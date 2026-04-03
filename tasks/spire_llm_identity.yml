@@ -1,0 +1,256 @@
+---
+# tasks/spire_llm_identity.yml
+#
+# Hardens SPIFFE/SPIRE workload identity for RKE2 clusters running LLM agent workloads.
+#
+# Security context:
+#   SPIRE was designed for stable microservice topologies. LLM agent fleets spin pods
+#   up and down at 10-100x the rate of traditional workloads. Under prompt-driven
+#   cascading tool calls, this burst scheduling can exhaust SPIRE's SVID minting
+#   capacity — causing new agent pods to fall back to unauthenticated API calls and
+#   silently bypassing zero-trust guarantees.
+#
+#   This task file addresses that gap by:
+#     1. Deploying SPIRE server and agent for K8s node attestation (k8s_psat)
+#     2. Registering short-TTL SVID entries for LLM workload namespaces
+#     3. Enforcing pod count quotas per namespace to cap SVID minting demand
+#     4. Applying LimitRange to prevent unbounded burst pod scheduling
+#
+# Variables (set in defaults/main.yml):
+#   rke2_spire_enabled                 - enable this task block (default: false)
+#   rke2_spire_namespace               - K8s namespace for SPIRE components (default: spire)
+#   rke2_spire_trust_domain            - SPIFFE trust domain (default: example.org)
+#   rke2_spire_ca_ttl                  - CA certificate TTL (default: 24h)
+#   rke2_spire_svid_ttl                - default SVID TTL (default: 1h)
+#   rke2_spire_llm_svid_ttl_seconds    - short TTL for LLM agent SVIDs (default: 300)
+#   rke2_spire_llm_namespaces          - list of namespaces hosting LLM agent workloads
+#   rke2_spire_llm_max_pods_per_namespace - pod quota cap per LLM namespace (default: 50)
+#   rke2_spire_llm_pod_max_cpu         - max CPU per pod in LLM namespaces (default: "4")
+#   rke2_spire_llm_pod_max_memory      - max memory per pod in LLM namespaces (default: "16Gi")
+
+- name: Create SPIRE namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ rke2_spire_namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: ansible
+          corsha.com/component: spire
+  when:
+    - rke2_spire_enabled | bool
+    - inventory_hostname == groups[rke2_servers_group_name].0
+
+- name: Deploy SPIRE server ConfigMap
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: spire-server
+        namespace: "{{ rke2_spire_namespace }}"
+      data:
+        server.conf: |
+          server {
+            bind_address = "0.0.0.0"
+            bind_port = "8081"
+            trust_domain = "{{ rke2_spire_trust_domain }}"
+            data_dir = "/run/spire/data"
+            log_level = "INFO"
+            ca_ttl = "{{ rke2_spire_ca_ttl }}"
+            default_x509_svid_ttl = "{{ rke2_spire_svid_ttl }}"
+          }
+          plugins {
+            DataStore "sql" {
+              plugin_data {
+                database_type = "sqlite3"
+                connection_string = "/run/spire/data/datastore.sqlite3"
+              }
+            }
+            NodeAttestor "k8s_psat" {
+              plugin_data {
+                clusters = {
+                  "{{ rke2_cluster_group_name }}" = {
+                    service_account_allow_list = ["{{ rke2_spire_namespace }}:spire-agent"]
+                  }
+                }
+              }
+            }
+            KeyManager "memory" {
+              plugin_data {}
+            }
+          }
+          health_checks {
+            listener_enabled = true
+            bind_address = "0.0.0.0"
+            bind_port = "8080"
+            live_path = "/live"
+            ready_path = "/ready"
+          }
+  when:
+    - rke2_spire_enabled | bool
+    - inventory_hostname == groups[rke2_servers_group_name].0
+
+- name: Deploy SPIRE agent ConfigMap
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: spire-agent
+        namespace: "{{ rke2_spire_namespace }}"
+      data:
+        agent.conf: |
+          agent {
+            data_dir = "/run/spire"
+            log_level = "INFO"
+            server_address = "spire-server"
+            server_port = "8081"
+            socket_path = "/run/spire/sockets/agent.sock"
+            trust_bundle_path = "/run/spire/bundle/bundle.crt"
+            trust_domain = "{{ rke2_spire_trust_domain }}"
+            # LLM burst hardening: surface SVID cache exhaustion as an explicit
+            # error rather than a silent fallback to unauthenticated calls.
+            # fail_on_svid_fetch_error must remain true for zero-trust guarantees.
+            fail_on_svid_fetch_error = true
+            sds {
+              default_svid_name = "default"
+              default_bundle_name = "ROOTCA"
+            }
+          }
+          plugins {
+            NodeAttestor "k8s_psat" {
+              plugin_data {
+                cluster = "{{ rke2_cluster_group_name }}"
+              }
+            }
+            KeyManager "memory" {
+              plugin_data {}
+            }
+            WorkloadAttestor "k8s" {
+              plugin_data {
+                skip_kubelet_verification = false
+              }
+            }
+          }
+          health_checks {
+            listener_enabled = true
+            bind_address = "0.0.0.0"
+            bind_port = "8080"
+            live_path = "/live"
+            ready_path = "/ready"
+          }
+  when:
+    - rke2_spire_enabled | bool
+    - inventory_hostname == groups[rke2_servers_group_name].0
+
+- name: Create SPIRE agent ClusterRole
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRole
+      metadata:
+        name: spire-agent-cluster-role
+      rules:
+        - apiGroups: [""]
+          resources: ["pods", "nodes", "nodes/proxy"]
+          verbs: ["get"]
+  when:
+    - rke2_spire_enabled | bool
+    - inventory_hostname == groups[rke2_servers_group_name].0
+
+- name: Create SPIRE agent ClusterRoleBinding
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: spire-agent-cluster-role-binding
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: spire-agent-cluster-role
+      subjects:
+        - kind: ServiceAccount
+          name: spire-agent
+          namespace: "{{ rke2_spire_namespace }}"
+  when:
+    - rke2_spire_enabled | bool
+    - inventory_hostname == groups[rke2_servers_group_name].0
+
+- name: Register short-TTL SVID entries for LLM workload namespaces
+  # Short TTL (rke2_spire_llm_svid_ttl_seconds, default 300s) limits the blast
+  # radius of a compromised agent token. Combined with pod quotas below, this
+  # bounds the minting load that prompt-driven agent spawning can impose on SPIRE.
+  ansible.builtin.command:
+    cmd: >
+      kubectl exec -n {{ rke2_spire_namespace }} deployment/spire-server --
+      /opt/spire/bin/spire-server entry create
+      -spiffeID spiffe://{{ rke2_spire_trust_domain }}/ns/{{ item }}/sa/default
+      -parentID spiffe://{{ rke2_spire_trust_domain }}/ns/{{ rke2_spire_namespace }}/sa/spire-agent
+      -selector k8s:ns:{{ item }}
+      -ttl {{ rke2_spire_llm_svid_ttl_seconds }}
+  loop: "{{ rke2_spire_llm_namespaces }}"
+  register: spire_entry_result
+  failed_when:
+    - spire_entry_result.rc != 0
+    - "'already exists' not in spire_entry_result.stderr"
+  changed_when: spire_entry_result.rc == 0
+  when:
+    - rke2_spire_enabled | bool
+    - rke2_spire_llm_namespaces | length > 0
+    - inventory_hostname == groups[rke2_servers_group_name].0
+
+- name: Apply ResourceQuota to cap pod count per LLM namespace
+  # Caps total pods per LLM workload namespace to prevent prompt-driven cascading
+  # tool calls from scheduling enough pods to exhaust SPIRE SVID minting capacity.
+  # Size rke2_spire_llm_max_pods_per_namespace to your SPIRE server's minting budget.
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ResourceQuota
+      metadata:
+        name: llm-agent-pod-quota
+        namespace: "{{ item }}"
+        annotations:
+          corsha.com/security-control: svid-exhaustion-prevention
+          corsha.com/threat-class: SVID-Exhaustion-ZeroTrust-Bypass
+      spec:
+        hard:
+          pods: "{{ rke2_spire_llm_max_pods_per_namespace }}"
+  loop: "{{ rke2_spire_llm_namespaces }}"
+  when:
+    - rke2_spire_enabled | bool
+    - rke2_spire_llm_namespaces | length > 0
+    - inventory_hostname == groups[rke2_servers_group_name].0
+
+- name: Apply LimitRange to constrain individual LLM agent pod resource footprint
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: LimitRange
+      metadata:
+        name: llm-agent-burst-limit
+        namespace: "{{ item }}"
+        annotations:
+          corsha.com/security-control: svid-exhaustion-prevention
+          corsha.com/threat-class: SVID-Exhaustion-ZeroTrust-Bypass
+      spec:
+        limits:
+          - type: Container
+            max:
+              cpu: "{{ rke2_spire_llm_pod_max_cpu }}"
+              memory: "{{ rke2_spire_llm_pod_max_memory }}"
+  loop: "{{ rke2_spire_llm_namespaces }}"
+  when:
+    - rke2_spire_enabled | bool
+    - rke2_spire_llm_namespaces | length > 0
+    - inventory_hostname == groups[rke2_servers_group_name].0

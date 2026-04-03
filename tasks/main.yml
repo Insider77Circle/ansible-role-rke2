@@ -107,5 +107,10 @@
     - hostvars[_host_item].inventory_hostname == inventory_hostname
     - rke2_restart_needed
 
+- name: SPIRE LLM workload identity hardening
+  ansible.builtin.include_tasks: spire_llm_identity.yml
+  when:
+    - rke2_spire_enabled | bool
+
 - name: Final steps
   ansible.builtin.include_tasks: summary.yml
